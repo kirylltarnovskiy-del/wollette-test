@@ -1,0 +1,69 @@
+spring:
+  application:
+    name: rate-limiter-service
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      cluster:
+        max-redirects: 3
+      timeout: 500ms
+      lettuce:
+        cluster:
+          refresh:
+            adaptive: true
+            period: 30s
+        pool:
+          max-active: 32
+          max-idle: 16
+          min-idle: 2
+          max-wait: 100ms
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+
+rate-limiter:
+  stream:
+    group: ${RATE_LIMITER_STREAM_GROUP:analytics}
+    consumer: ${RATE_LIMITER_STREAM_CONSUMER:${HOSTNAME:${spring.application.name:rate-limiter-service}}}
+    batch-size: ${RATE_LIMITER_STREAM_BATCH_SIZE:100}
+  tiers:
+    FREE:
+      - name: per_second
+        window: PT1S
+        max-requests: 10
+        burst-capacity: 15
+        algorithm: TOKEN_BUCKET
+      - name: per_minute
+        window: PT1M
+        max-requests: 100
+        burst-capacity: 100
+        algorithm: SLIDING_WINDOW_COUNTER
+    PREMIUM:
+      - name: per_second
+        window: PT1S
+        max-requests: 100
+        burst-capacity: 140
+        algorithm: TOKEN_BUCKET
+      - name: per_minute
+        window: PT1M
+        max-requests: 3000
+        burst-capacity: 3000
+        algorithm: SLIDING_WINDOW_COUNTER
+    ENTERPRISE:
+      - name: per_second
+        window: PT1S
+        max-requests: 1000
+        burst-capacity: 1500
+        algorithm: TOKEN_BUCKET
+      - name: per_minute
+        window: PT1M
+        max-requests: 50000
+        burst-capacity: 50000
+        algorithm: SLIDING_WINDOW_COUNTER
