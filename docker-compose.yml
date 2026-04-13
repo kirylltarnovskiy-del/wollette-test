@@ -1,0 +1,178 @@
+services:
+
+  # ── Redis Cluster — 6 nodes: 3 masters + 3 replicas ───────────────────────
+  # Uses official redis image to avoid registry-specific tags.
+  # Cluster bootstrap is handled by redis-cluster-init after all nodes are up.
+
+  redis-node-0:
+    image: redis:7.2-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --bind 0.0.0.0
+      --port 6379
+      --protected-mode no
+      --cluster-announce-hostname redis-node-0
+      --cluster-announce-port 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-node-1:
+    image: redis:7.2-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --bind 0.0.0.0
+      --port 6379
+      --protected-mode no
+      --cluster-announce-hostname redis-node-1
+      --cluster-announce-port 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-node-2:
+    image: redis:7.2-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --bind 0.0.0.0
+      --port 6379
+      --protected-mode no
+      --cluster-announce-hostname redis-node-2
+      --cluster-announce-port 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-node-3:
+    image: redis:7.2-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --bind 0.0.0.0
+      --port 6379
+      --protected-mode no
+      --cluster-announce-hostname redis-node-3
+      --cluster-announce-port 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-node-4:
+    image: redis:7.2-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --bind 0.0.0.0
+      --port 6379
+      --protected-mode no
+      --cluster-announce-hostname redis-node-4
+      --cluster-announce-port 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-node-5:
+    image: redis:7.2-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --bind 0.0.0.0
+      --port 6379
+      --protected-mode no
+      --cluster-announce-hostname redis-node-5
+      --cluster-announce-port 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-cluster-init:
+    image: redis:7.2-alpine
+    depends_on:
+      redis-node-0: { condition: service_healthy }
+      redis-node-1: { condition: service_healthy }
+      redis-node-2: { condition: service_healthy }
+      redis-node-3: { condition: service_healthy }
+      redis-node-4: { condition: service_healthy }
+      redis-node-5: { condition: service_healthy }
+    restart: "no"
+    command: >
+      sh -c "
+      redis-cli -h redis-node-0 -p 6379 cluster info | grep -q 'cluster_state:ok' &&
+      exit 0;
+      echo yes | redis-cli --cluster create
+      redis-node-0:6379 redis-node-1:6379 redis-node-2:6379
+      redis-node-3:6379 redis-node-4:6379 redis-node-5:6379
+      --cluster-replicas 1
+      "
+
+  # ── Application nodes ─────────────────────────────────────────────────────
+  app-1:
+    build: .
+    image: ${APP_IMAGE:-wollette-test-app:latest}
+    ports:
+      - "${APP1_PORT:-8081}:8080"
+    environment:
+      SPRING_DATA_REDIS_CLUSTER_NODES: "redis-node-0:6379,redis-node-1:6379,redis-node-2:6379,redis-node-3:6379,redis-node-4:6379,redis-node-5:6379"
+      RATE_LIMITER_STREAM_GROUP: ${RATE_LIMITER_STREAM_GROUP:-analytics}
+      RATE_LIMITER_STREAM_BATCH_SIZE: ${RATE_LIMITER_STREAM_BATCH_SIZE:-100}
+      RATE_LIMITER_STREAM_CONSUMER: ${APP1_STREAM_CONSUMER:-rate-limiter-1}
+    depends_on:
+      redis-cluster-init: { condition: service_completed_successfully }
+
+  app-2:
+    image: ${APP_IMAGE:-wollette-test-app:latest}
+    ports:
+      - "${APP2_PORT:-8082}:8080"
+    environment:
+      SPRING_DATA_REDIS_CLUSTER_NODES: "redis-node-0:6379,redis-node-1:6379,redis-node-2:6379,redis-node-3:6379,redis-node-4:6379,redis-node-5:6379"
+      RATE_LIMITER_STREAM_GROUP: ${RATE_LIMITER_STREAM_GROUP:-analytics}
+      RATE_LIMITER_STREAM_BATCH_SIZE: ${RATE_LIMITER_STREAM_BATCH_SIZE:-100}
+      RATE_LIMITER_STREAM_CONSUMER: ${APP2_STREAM_CONSUMER:-rate-limiter-2}
+    depends_on:
+      redis-cluster-init: { condition: service_completed_successfully }
+
+  app-3:
+    image: ${APP_IMAGE:-wollette-test-app:latest}
+    ports:
+      - "${APP3_PORT:-8083}:8080"
+    environment:
+      SPRING_DATA_REDIS_CLUSTER_NODES: "redis-node-0:6379,redis-node-1:6379,redis-node-2:6379,redis-node-3:6379,redis-node-4:6379,redis-node-5:6379"
+      RATE_LIMITER_STREAM_GROUP: ${RATE_LIMITER_STREAM_GROUP:-analytics}
+      RATE_LIMITER_STREAM_BATCH_SIZE: ${RATE_LIMITER_STREAM_BATCH_SIZE:-100}
+      RATE_LIMITER_STREAM_CONSUMER: ${APP3_STREAM_CONSUMER:-rate-limiter-3}
+    depends_on:
+      redis-cluster-init: { condition: service_completed_successfully }
+
