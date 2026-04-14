@@ -1,0 +1,412 @@
+{
+  "info": {
+    "name": "Rate Limiter Service",
+    "_postman_id": "2d7382e6-6d56-4f0f-bd98-5f8f4f2a70ab",
+    "description": "Collection for testing the rate limiter service with multiple scenarios: health, tiered requests, rejection path, stats/usage, and a burst loop runner.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "endpoint",
+      "value": "/payments"
+    },
+    {
+      "key": "freeUserId",
+      "value": "free-user-1"
+    },
+    {
+      "key": "premiumUserId",
+      "value": "premium-user-1"
+    },
+    {
+      "key": "enterpriseUserId",
+      "value": "ent-user-1"
+    },
+    {
+      "key": "targetUserId",
+      "value": "free-user-1"
+    },
+    {
+      "key": "windowSeconds",
+      "value": "60"
+    },
+    {
+      "key": "burstTotalRequests",
+      "value": "25"
+    },
+    {
+      "key": "burstCounter",
+      "value": "0"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Health and Observability",
+      "item": [
+        {
+          "name": "Health - GET /actuator/health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "health"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Prometheus - GET /actuator/prometheus",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/prometheus",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "prometheus"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Core Rate Limiting",
+      "item": [
+        {
+          "name": "Allow - Free tier request",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{freeUserId}}\",\n  \"endpoint\": \"{{endpoint}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/request",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "request"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200 or 429', function () {",
+                  "  pm.expect([200, 429]).to.include(pm.response.code);",
+                  "});",
+                  "const json = pm.response.json();",
+                  "pm.test('Response has required fields', function () {",
+                  "  pm.expect(json).to.have.property('allowed');",
+                  "  pm.expect(json).to.have.property('userId');",
+                  "  pm.expect(json).to.have.property('endpoint');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Allow - Premium tier request",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{premiumUserId}}\",\n  \"endpoint\": \"{{endpoint}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/request",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "request"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Allow - Enterprise tier request",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{enterpriseUserId}}\",\n  \"endpoint\": \"{{endpoint}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/request",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "request"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Validation fail - Missing endpoint (expect 400)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{freeUserId}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/request",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "request"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 400', function () {",
+                  "  pm.response.to.have.status(400);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. Burst Simulation (Collection Runner)",
+      "description": "Run this folder in Collection Runner. It repeatedly sends /request for a free user and demonstrates accepted/rejected behavior near the limit.",
+      "item": [
+        {
+          "name": "Init burst loop",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "health"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('burstCounter', '0');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "postman.setNextRequest('Burst loop request');"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Burst loop request",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{freeUserId}}\",\n  \"endpoint\": \"{{endpoint}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/request",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "request"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const count = parseInt(pm.collectionVariables.get('burstCounter') || '0', 10) + 1;",
+                  "pm.collectionVariables.set('burstCounter', String(count));",
+                  "pm.test('Status is 200 or 429', function () {",
+                  "  pm.expect([200, 429]).to.include(pm.response.code);",
+                  "});",
+                  "const limit = parseInt(pm.collectionVariables.get('burstTotalRequests') || '25', 10);",
+                  "if (count < limit) {",
+                  "  postman.setNextRequest('Burst loop request');",
+                  "} else {",
+                  "  postman.setNextRequest('Stats - window summary');",
+                  "}"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4. Analytics and Usage",
+      "item": [
+        {
+          "name": "Stats - window summary",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/stats?windowSeconds={{windowSeconds}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "stats"
+              ],
+              "query": [
+                {
+                  "key": "windowSeconds",
+                  "value": "{{windowSeconds}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "const json = pm.response.json();",
+                  "pm.test('Stats payload has expected fields', function () {",
+                  "  pm.expect(json).to.have.property('requestsPerSecond');",
+                  "  pm.expect(json).to.have.property('accepted');",
+                  "  pm.expect(json).to.have.property('rejected');",
+                  "  pm.expect(json).to.have.property('topUsers');",
+                  "  pm.expect(json).to.have.property('windowStats');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "User usage - GET /users/{id}/usage",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/users/{{targetUserId}}/usage",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "users",
+                "{{targetUserId}}",
+                "usage"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "const json = pm.response.json();",
+                  "pm.test('Usage payload has expected fields', function () {",
+                  "  pm.expect(json).to.have.property('userId');",
+                  "  pm.expect(json).to.have.property('total');",
+                  "  pm.expect(json).to.have.property('accepted');",
+                  "  pm.expect(json).to.have.property('rejected');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
