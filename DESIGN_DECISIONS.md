@@ -34,21 +34,46 @@ For endpoints where bursts are expected and acceptable, the Token Bucket algorit
 
 The system must be thread-safe, free of race conditions under high load, and demonstrate correctness under concurrent requests.
 
-### Decision: Lock-Free Algorithms Using Compare-And-Swap (CAS)
+### Decision: Atomicity via Redis Lua Scripts
 
 The most dangerous race condition in a rate limiter is the check-then-act problem: a thread reads the current counter, decides the request is within the limit, and then increments — but between the read and the write, another thread has already incremented the counter, causing both threads to be allowed when only one should have been.
 
-The solution is to make the check and the update a single atomic operation. For the in-process algorithms, this is achieved using Java's `AtomicReference` with a compare-and-swap loop: a thread reads the current state, computes the new state, and only writes it back if the state has not been changed by another thread in the meantime. If the swap fails, the thread retries. This is called a CAS loop.
+The implementation solves this by executing the entire check-and-update as a **single Redis Lua script**. Redis is single-threaded with respect to command execution: a Lua script runs to completion on the server before any other command is processed. The scripts (`token_bucket.lua`, `sliding_window.lua`) read state, compute the new state, write it back, and return the decision — all in one server-side operation. No other client can interleave between the read and the write. This is the distributed equivalent of an atomic compare-and-swap.
 
-**Why CAS over `synchronized` blocks?** Under high concurrency, a synchronized block serializes all threads through a single lock, which becomes a throughput bottleneck as thread count grows. CAS is optimistic — it assumes conflicts are rare, attempts the update without locking, and only retries on actual conflict. In practice, CAS delivers 3 to 10 times higher throughput than synchronized blocks for this workload.
+### Known Problems with the Current Lua Script Implementation
 
-**Why CAS over `ReentrantLock`?** ReentrantLock is more flexible than synchronized but still involves blocking — a thread waiting for the lock is descheduled and must be rescheduled when the lock is released, which has OS-level overhead. CAS avoids descheduling entirely; retrying threads stay on-CPU for the microseconds it takes to retry.
+**1. Redis is a required single point of atomicity.** The entire concurrency guarantee depends on Redis being available. If the circuit breaker opens (see Failure Handling), the fallback is fail-open — requests are allowed without any counter check. During a Redis outage, the check-then-act problem re-emerges fully: there is no in-process fallback that maintains the limit. This is an explicit availability-over-correctness trade-off.
 
-**Trade-off:** Under extreme contention — many threads all racing to update the exact same user's bucket simultaneously — CAS retry loops can spin hot and consume CPU. This is mitigated in two ways: first, by using `Thread.onSpinWait()` between retries (a CPU hint that reduces power and allows sibling threads to progress); second, by the fact that in realistic traffic, even the busiest user is not being updated by thousands of threads simultaneously.
+**2. Clock skew on the client side.** The Lua scripts receive `nowMs` as a parameter passed in from the Java application (`Instant.now().toEpochMilli()`). If application nodes have drifted clocks, the `elapsed` calculation inside the Token Bucket script becomes unreliable: a node with a clock running ahead will over-refill tokens; a node with a clock running behind will under-refill. The scripts themselves have no access to a monotonic server-side clock.
 
-### Decision: Correctness Demonstrated via Concurrency Tests with CountDownLatch
+**3. Script loading latency on first call.** `DefaultRedisScript` with `ClassPathResource` loads and SHA-caches the script on first execution. Under a cold start with very high initial traffic, this adds a one-time per-node latency spike. Scripts can be pre-loaded with `SCRIPT LOAD` at deploy time to avoid this.
 
-The invariant of a correct rate limiter is that the number of accepted requests never exceeds the configured limit, regardless of how many threads fire simultaneously. This is verified in tests by launching hundreds of threads behind a starting gate latch, releasing them all at once, and asserting that the accepted count is within the limit and that accepted plus rejected equals total.
+**4. No in-process rate limiting layer.** Every single request requires a network round-trip to Redis for the rate limit decision. At sub-millisecond Redis latency this is acceptable, but under Redis cluster degradation (e.g., leader election, replica promotion) P99 latency spikes directly translate into rate limiter latency spikes. There is no local fast-path.
+
+### Why CAS with a Different Storage Model Could Be Better in Production
+
+A Java CAS loop operating on in-process state eliminates the network entirely — the check-and-update completes in nanoseconds on the same CPU. The trade-off is that this state is local to one JVM and cannot be shared across app nodes. However, there are production architectures that make this work:
+
+- **Sticky routing at the load balancer:** If requests for a given user are always routed to the same app node (by hashing `userId` at the load balancer), then per-node CAS is globally correct — each user's counter lives on exactly one node. This is the architecture that consistent hashing is designed to enable. Counter state can be periodically flushed to Redis for durability without making Redis the synchronization point for every request.
+- **Local CAS as a first-pass pre-filter:** Even without sticky routing, a node-local CAS counter can act as a fast rejection layer. If a user is clearly over the limit on the local node, the request is rejected immediately without touching Redis. Only requests that pass the local check proceed to Redis for the authoritative global check. This cuts Redis load proportionally to the rejection rate.
+- **Token Bucket with eventual consistency:** Each node holds a fraction of the token budget (total capacity divided by node count). Tokens are consumed locally via CAS with no coordination. Periodically, nodes gossip their consumed counts to reconcile the global budget. This allows brief over-admission at rebalance boundaries but eliminates per-request Redis dependency entirely.
+
+The current implementation favours **operational simplicity and strong consistency** (one Redis cluster, one Lua script, zero per-request coordination between app nodes) over **maximum throughput and Redis independence**. CAS-based local state would be the right next step if Redis latency or availability became the measured production bottleneck.
+
+### Why Couchbase Would Be a Better Fit for CAS-Based Rate Limiting
+
+Couchbase is the most direct upgrade path for this architecture because it makes CAS a first-class storage primitive rather than something emulated on top of a scripting layer.
+
+**Concrete advantages over the Redis Lua approach:**
+
+- **No scripting layer required.** The atomicity guarantee is built into the Couchbase storage engine, not emulated via server-side script execution. There is no equivalent of the script loading latency problem (problem 3 above), and the check-and-update logic lives in application code rather than embedded Lua.
+- **Clock skew immunity.** Because the decision logic runs in the application and the CAS value guards the document against stale writes, the `nowMs` clock dependency moves entirely client-side where it is already under the application's control. There is no server-side `elapsed` calculation that a drifted clock can corrupt — the token count and timestamp are just fields in a JSON document, updated atomically only if no one else touched the document first.
+- **Sub-millisecond KV latency at scale.** Couchbase key-value operations run directly against memory on the owning node in the cluster; the document is not replicated to other nodes before the response is returned. In practice this is comparable to Redis latency.
+- **Built-in durability levels.** Unlike Redis, where persistence is asynchronous and a crash can lose recent writes, Couchbase lets you specify per-operation durability: majority-replicated, persisted to disk, or fire-and-forget. A rate limiter can use fire-and-forget (same consistency as Redis) or step up to majority-replicated for critical enforcement scenarios without changing the client API.
+
+**Trade-off:** Under high contention on a single bucket document — many app nodes retrying CAS simultaneously for the same hot user — the retry loop can amplify write load on that document's owning node. This is the distributed version of the CAS spin problem described above. Mitigation is the same as in-process: use exponential backoff between retries, and accept that hot users under extreme burst will see slightly higher decision latency during the retry window.
+
+**Trade-off: Operational complexity.** Couchbase requires managing a proper cluster with its own rebalancing, index, and eviction mechanics. Redis's operational model is simpler for teams already running it. The CAS gain is worth the switch only if rate limiter correctness during partial outages is a hard requirement — if fail-open is acceptable, Redis Lua remains the simpler path.
 
 ---
 
@@ -71,9 +96,57 @@ Pure in-memory state does not survive application restarts and cannot be shared 
 **Why not Cassandra or another distributed database?**
 Cassandra offers excellent horizontal write scalability, but its conditional updates (`IF` clauses using Lightweight Transactions) are significantly slower than Redis operations and involve multi-round-trip Paxos consensus. The atomicity guarantees needed for rate limiting — check and increment as one operation — are simpler and faster to express in Redis via Lua scripts.
 
-**Trade-off: Redis as a single point of failure.** If Redis goes down, the rate limiter cannot make decisions. This is handled by a circuit breaker (see Failure Handling section) that fails open — allowing requests through — when Redis is unavailable. The brief burst during a Redis outage is preferable to rejecting all traffic.
+**Trade-off: Redis as a single point of failure.** If Redis goes down, the rate limiter cannot make decisions. In this project, the circuit breaker is configured to fail open (allow requests) because this limiter is treated as a user-facing API quota control where availability is prioritized over strict enforcement. BUT!!!!! That policy is context-dependent: for outbound protection (protecting downstream dependencies from overload), fail-open is usually the wrong choice because it removes the safety barrier exactly when control is needed most. In that outbound case, the safer policy is fail-closed (block or aggressively shed traffic), optionally with a small local fallback budget, so downstream systems are protected during Redis outages.
 
 **Trade-off: Redis memory is finite.** Rate limit state for millions of users could consume significant memory. This is managed by attaching a TTL (time to live) to every Redis key. A key expires automatically after twice its window duration, so inactive users' keys are cleaned up without any manual eviction logic.
+
+### Redis Sharding Problem: Hot Keys and the Analytics Stream
+
+The current architecture has a structural hot-key problem at two points:
+
+**Rate limit state keys.** Redis Cluster shards keys across masters by hash slot. Because the Token Bucket script uses hash tags (`{userId}`) to pin a user's key to a single slot, all traffic for the same user lands on one master node. An enterprise user generating 10,000 requests per second creates a hot slot on one master that the cluster cannot rebalance away — the hash tag prevents the key from migrating.
+
+**The analytics stream key.** `rate-limit-events` is a single Redis Stream key. A single key maps to exactly one hash slot and therefore one master node. All three app nodes append to it, all three consumer groups read from it, and there is no way to distribute this load across the cluster. This is noted in the Bottlenecks section: mitigation is to shard the stream by `userId % N`, but this requires `N` separate XREADGROUP consumers per app node and `N` streams to monitor operationally.
+
+### Why ClickHouse Would Solve the Analytics Sharding Problem
+
+ClickHouse is a columnar OLAP database built specifically for high-throughput append-only workloads — exactly what the analytics stream produces. Replacing the Redis Stream + `AnalyticsAggregator` pipeline with ClickHouse resolves every sharding limitation described above.
+
+**How the architecture would change:**
+
+Instead of writing rate limit events to a Redis Stream (`XADD rate-limit-events`), each app node would insert a row into a ClickHouse table directly (or buffer via a local queue and batch-insert):
+
+```sql
+INSERT INTO rate_limit_events (user_id, endpoint, allowed, ts)
+VALUES ('user-123', '/request', 1, now64())
+```
+
+ClickHouse `ReplicatedMergeTree` (or `ReplicatedSummingMergeTree` for pre-aggregation) distributes data across shards by the partition key. Setting the partition key to `toYYYYMMDD(ts)` and the shard key to `cityHash64(user_id)` means traffic for every user is spread across all ClickHouse nodes without hash-tag pinning constraints.
+
+**Why this solves the hot-key problem specifically:**
+
+Redis sharding unit is a key. One key means one slot and one master. ClickHouse sharding unit is a row. Rows from the same user are written to the shard selected by the hash of `user_id`, and ClickHouse can rebalance shards independently of which user generated the data. There is no equivalent of the hash-tag constraint. At one million events per second across 10 users, every shard receives writes — not just the one that owns the hot user's slot.
+
+**Analytics query performance:**
+
+The `/stats` endpoint currently aggregates accepted/rejected totals from an in-memory ring buffer populated by stream consumers. Each app node reports only its share. In a ClickHouse model, all nodes write to the same cluster and queries aggregate globally:
+
+```sql
+SELECT
+    toStartOfSecond(ts) AS second,
+    countIf(allowed = 1) AS accepted,
+    countIf(allowed = 0) AS rejected
+FROM rate_limit_events
+WHERE ts >= now() - INTERVAL 60 SECOND
+GROUP BY second
+ORDER BY second
+```
+
+This query runs in milliseconds on very large datasets and returns a globally consistent view regardless of which app node a client queries — something the current per-instance ring buffer cannot provide.
+
+**Trade-off: ClickHouse is not a rate limit state store.** ClickHouse is append-optimized and does not support the read-modify-write pattern that a Token Bucket requires. The rate limit decision path (the Lua scripts, or Couchbase CAS as described above) must stay on a low-latency key-value store. ClickHouse replaces only the analytics pipeline — the Redis Stream, the `AnalyticsAggregator` ring buffer, and the top-user ZSET — not the enforcement layer.
+
+**Trade-off: Operational cost.** ClickHouse adds a second storage system to operate alongside Redis (or Couchbase). This is justified when analytics query volume or cardinality grows large enough that Redis memory and the single-stream bottleneck become measured problems. At lower scale, the current Redis Stream approach is simpler to run.
 
 ---
 
@@ -154,6 +227,116 @@ User request counts are stored in a Redis Sorted Set. Each event increments the 
 
 **Trade-off:** For extremely high cardinality (hundreds of millions of distinct users), a Redis Sorted Set storing every user would consume significant memory. The production-scale solution would be a Count-Min Sketch combined with a bounded min-heap, which approximates top-K with sub-linear memory. For this service's expected scale, the exact Sorted Set approach is appropriate.
 
+### Why This Design Is Appropriate for a Test Task — and What Production Would Change
+
+This analytics implementation makes a conscious trade: keep everything inside Redis so the system has zero extra infrastructure. The ring buffer lives in JVM heap (3,600 `AtomicLong` pairs), the per-user usage counters live in Redis hashes, and the top-user ranking lives in a Redis Sorted Set. For a test task, this is the right call — the important concepts (async delivery, at-least-once semantics, O(1) aggregation, global top-K) are all demonstrated without spinning up additional systems.
+
+Two production-grade alternatives are worth understanding in detail: **Cassandra** for durable per-user time-series storage, and **ClickHouse** for high-throughput OLAP analytics.
+
+### Alternative: Cassandra for Per-User Time-Series
+
+Cassandra is a wide-column store designed around write-heavy, time-series workloads with predictable read patterns. It is a natural fit for per-user usage history where the query pattern is always "give me user X's events in time range [T1, T2]".
+
+**How the schema would look:**
+
+```cql
+CREATE TABLE rate_limit_events (
+    user_id   text,
+    ts        timestamp,
+    endpoint  text,
+    allowed   boolean,
+    tier      text,
+    PRIMARY KEY (user_id, ts)
+) WITH CLUSTERING ORDER BY (ts DESC)
+  AND default_time_to_live = 2592000;  -- 30 days
+```
+
+The partition key is `user_id`, so all events for a given user land on the same set of replicas. The clustering key is `ts`, so events are physically stored in descending time order and range queries like "last 60 seconds for user X" are a single sequential read with no scatter-gather. TTL is built in — no separate eviction logic like the `PEXPIRE` workaround in the current Redis adapter.
+
+**What it replaces in this app:**
+
+- The `analytics:user:{id}` Redis hashes (per-user accepted/rejected totals) — replaced by aggregating from the Cassandra time-series.
+- The ring buffer in `AnalyticsAggregator` — replaced by a `GROUP BY toSecond(ts)` query scoped to the last N seconds.
+
+**Why it was not chosen for this task:** Cassandra requires at minimum a 3-node cluster for meaningful replication, a separate coordinator process, and careful tuning of consistency levels for counter workloads. The operational cost is not justified when the goal is to demonstrate the analytics concepts.
+
+**Remaining limitation compared to ClickHouse:** Cassandra is excellent for single-user lookups but slow for cross-user aggregations like "total requests per second across all users" — that query requires reading from every partition. ClickHouse handles that case better.
+
+### Alternative: ClickHouse for OLAP Analytics (Production Recommendation)
+
+ClickHouse is a columnar OLAP database built for exactly this workload: append-only, high-throughput event streams with arbitrary aggregation queries. As discussed in Section 3, it also resolves the Redis hot-key problem for the analytics stream. This is the recommended path if this service were taken to production.
+
+**How the schema would look:**
+
+```sql
+CREATE TABLE rate_limit_events
+(
+    user_id   String,
+    endpoint  String,
+    allowed   UInt8,
+    tier      String,
+    ts        DateTime64(3)
+)
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/rate_limit_events', '{replica}')
+PARTITION BY toYYYYMMDD(ts)
+ORDER BY (user_id, ts)
+TTL ts + INTERVAL 30 DAY;
+```
+
+**What each analytics query becomes:**
+
+The `/stats?window=60` endpoint, currently served by the in-process ring buffer (which only reflects the current node's consumed share of the stream), becomes a globally consistent query:
+
+```sql
+SELECT
+    toStartOfSecond(ts) AS second,
+    countIf(allowed = 1) AS accepted,
+    countIf(allowed = 0) AS rejected
+FROM rate_limit_events
+WHERE ts >= now() - INTERVAL 60 SECOND
+GROUP BY second
+ORDER BY second
+```
+
+The `/users/{id}/usage` endpoint, currently served by Redis hashes written by `AnalyticsAggregator`, becomes:
+
+```sql
+SELECT
+    countIf(allowed = 1) AS accepted,
+    countIf(allowed = 0) AS rejected,
+    count()               AS total
+FROM rate_limit_events
+WHERE user_id = 'user-123'
+  AND ts >= now() - INTERVAL 30 DAY
+```
+
+The top-users ranking, currently a Redis Sorted Set with unbounded memory growth, becomes:
+
+```sql
+SELECT user_id, count() AS requests
+FROM rate_limit_events
+WHERE ts >= now() - INTERVAL 1 DAY
+GROUP BY user_id
+ORDER BY requests DESC
+LIMIT 10
+```
+
+**Key differences from the current implementation:**
+
+
+| Concern                 | Current (Redis)                                 | ClickHouse                                     |
+| ----------------------- | ----------------------------------------------- | ---------------------------------------------- |
+| Per-second stats source | In-process ring buffer — per-node partial view  | Global query across all nodes' events          |
+| Per-user usage          | Redis hash with `HINCRBY` — lost on hash expiry | Time-series rows — TTL handled by table engine |
+| Top-K users             | Redis Sorted Set — unbounded memory             | Aggregation query — no memory growth           |
+| Retention policy        | Manual `PEXPIRE` on each key                    | Declarative `TTL ts + INTERVAL 30 DAY`         |
+| Cardinality limit       | Memory-bound (millions of keys expensive)       | Column-compressed — billions of rows routine   |
+
+
+**Trade-off: ClickHouse is not a key-value store.** It cannot replace Redis for the rate limit decision path (Token Bucket CAS / Lua scripts require sub-millisecond read-modify-write, which ClickHouse does not support). ClickHouse replaces only the analytics pipeline. In a production architecture, both would coexist: Redis (or Couchbase) for the enforcement hot path, ClickHouse for analytics.
+
+**Trade-off: Insertion latency.** ClickHouse is optimized for batch inserts, not single-row inserts. The current architecture fires one `XADD` per event to the Redis Stream. In a ClickHouse setup, the equivalent would be batching events in a local buffer (or continuing to use Redis Streams as a transport) and flushing to ClickHouse in bulk every few seconds. This adds a small analytics delay but is standard practice and does not affect the rate limiting decision latency at all.
+
 ---
 
 ## 6. API Layer
@@ -176,29 +359,45 @@ These are not arbitrary choices — RFC 6585 defines 429 as the correct status c
 
 Simulate at least one failure mode (node crash, clock skew, or partial data loss) and explain system behavior.
 
-All three failure modes are simulated.
+The failure simulations in this project target Redis availability, which is the real source of distributed coordination risk in the current architecture. Two failure modes are runnable as live k6 scenarios against the full Docker Compose stack.
 
-### Node Crash
+### Failure Mode 1: Full Redis Outage
 
-A node's health flag is toggled to simulate a crash. The consistent hash ring detects the unavailability and routes the user to the next node in the ring. The new node starts with no state for that user, effectively resetting their counters.
+**Simulation:** `scenarios/redis-outage.js` drives live HTTP traffic while Redis is killed mid-test (`docker compose stop redis-node-0 redis-node-1 redis-node-2`) and then restarted.
 
-**System behavior:** The user can briefly exceed their rate limit during the window in which they were remapped, because the new node's counters start at zero. This is the fail-open decision: during a node failure, it is preferable to allow a brief burst than to reject all traffic. The system returns to correct behavior within one window duration after the failure.
+**System behavior — three phases:**
 
-**Alternative (fail-closed):** Reject all requests for users whose primary node is unavailable. This prevents any burst but degrades availability. For this service, fail-open is the correct default because rate limiting is soft enforcement. A billing or security system would require fail-closed.
 
-### Clock Skew
+| Phase    | Duration | What happens                                                                                                                                                                |
+| -------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Healthy  | 0—30 s   | Normal 200/429 mix. Circuit breaker CLOSED.                                                                                                                                 |
+| Outage   | 30—90 s  | All Redis calls fail. Resilience4j opens the circuit. `allowOnFailure()` returns `true` for every request. Rate limiting pauses — 429s stop, everything gets 200. Zero 5xx. |
+| Recovery | 90—120 s | Redis restarts. Circuit transitions HALF-OPEN — CLOSED. 429s resume within seconds.                                                                                         |
 
-Each simulated node can be assigned a clock offset. This demonstrates how different nodes may disagree on window boundaries.
 
-**System behavior:** With Sliding Window Counter, a node that is 500 milliseconds ahead of another node will start a new window earlier. A user whose requests are split across both nodes at the window boundary may be allowed more requests than intended for a brief period. With Token Bucket, this problem does not occur — Token Bucket uses monotonic time (elapsed nanoseconds) for interval calculations rather than wall-clock time for window boundaries, making it immune to clock skew.
+**Implementation detail:** Both `allowTokenBucket` and `allowSlidingWindowCounter` in `RedisRateLimiterAdapter` are annotated `@CircuitBreaker(name = "redisRateLimiter", fallbackMethod = "allowOnFailure")`. The fallback returns `true` unconditionally. This is an explicit availability-over-correctness trade-off: brief over-counting during an outage is preferable to denying all traffic with 5xx errors.
 
-**Mitigation in production:** NTP synchronization keeps node clocks within 1 to 10 milliseconds of each other. At this precision, the window boundary drift is negligible. The Clock Skew simulation sets offsets of hundreds of milliseconds to make the effect clearly observable.
+**Test task scope vs production:** Fail-open is the right default for a soft-enforcement rate limiter. A billing or fraud-control system would require fail-closed — or a local in-memory fallback counter that degrades gracefully — rather than dropping all enforcement.
 
-### Partial Data Loss
+### Failure Mode 2: Redis Cluster Master Failover
 
-A node's in-memory state is cleared to simulate a crash-and-restart scenario.
+**Simulation:** `scenarios/cluster-failover.js` kills one Redis cluster master (`docker compose stop redis-node-1`) mid-traffic and restarts it later, with three users whose keys are distributed across all three shards.
 
-**System behavior:** Users whose state was on the affected node have their counters reset to zero. They can make requests up to their full limit again before the window expires. In the Redis-backed production configuration, this failure mode does not apply to the rate limit state itself — Redis AOF persistence ensures state survives application restarts. The simulation is meaningful for the in-process algorithm state maintained for the distributed node simulation.
+**System behavior — three phases:**
+
+
+| Phase         | Duration | What happens                                                                                                                                                                                                                                                                                                                                                 |
+| ------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Healthy       | 0—30 s   | Full cluster up. Normal 200/429 mix. `rl_failover_errors=0`.                                                                                                                                                                                                                                                                                                 |
+| Election      | 30—90 s  | `redis-node-1` dies. The cluster elects `redis-node-4` (its replica) as the new master in ~1—5 s. During the election window, requests for keys mapped to the lost shard may see brief connection errors — `rl_failover_errors` spikes. The circuit breaker absorbs these as fail-open. After Lettuce adaptive topology refresh, full rate limiting resumes. |
+| Reintegration | 90—120 s | `redis-node-1` restarts and rejoins as a replica. Zero client-visible disruption.                                                                                                                                                                                                                                                                            |
+
+
+**Key assertion:** `rl_server_errors` stays at zero throughout all phases. The 1—5 s election window produces at most ~30 `rl_failover_errors` (transport-level, not 5xx), which the scenario threshold permits.
+
+### What is not simulated in the HTTP path
+
+Clock-skew and in-memory partial-data-loss simulations (`RateLimiterNode.setClockOffsetMs()`, state clearing) exist in the codebase but are exercised by JMH benchmarks rather than the runtime API decision path. For this test task that scope is sufficient; in a production deployment these would be covered by chaos engineering tooling (for example Chaos Mesh or Gremlin).
 
 ---
 
@@ -208,18 +407,72 @@ A node's in-memory state is cleared to simulate a crash-and-restart scenario.
 
 Simulate multiple nodes (even in-process) and demonstrate a sharding or partitioning strategy.
 
-### Decision: In-Process Consistent Hash Ring Simulation
+### Decision: Multi-Instance App + Redis Cluster Partitioning
 
-Multiple `RateLimiterNode` instances are created in-process, each with its own state and health flag. A `ConsistentHashRing` routes incoming requests to the appropriate node by hashing the user ID.
+Three Spring Boot app instances (`app-1`, `app-2`, `app-3`) serve traffic against a 6-node Redis Cluster (3 masters + 3 replicas). App instances are stateless with respect to rate-limit counters — Redis is the single shared source of truth.
 
-**Why in-process?** The requirement explicitly permits in-process simulation. Running actual separate JVM processes or containers would add infrastructure complexity that distracts from demonstrating the algorithmic and architectural concepts.
+**Sharding strategy:** Redis Cluster hash-slot partitioning. Rate-limit keys use Redis hash tags — for example `rl:tb:{<userId>:<endpoint>:<rule>}` and `rl:sw:{<userId>:<endpoint>:<rule>}:<windowStart>` — so all keys for a given user+endpoint+rule land on the same shard and can be operated on atomically by a single Lua script execution.
 
-**What is being demonstrated?**
+**What is demonstrated:**
 
-- That user traffic is deterministically routed — the same user always reaches the same node in the steady state.
-- That node addition and removal remaps only a fraction of users (not all of them).
-- That failure handling routes around unavailable nodes.
-- That the system recovers correctly when a node comes back online.
+- Global rate-limit enforcement across all three app instances, proven by `steady-state.js` showing identical accepted/rejected totals on every node.
+- Shard-level failure tolerance, demonstrated by `cluster-failover.js`.
+- Stateless app tier: any app node can handle any user without coordination between app instances.
+
+### Production Kubernetes Architecture
+
+The Docker Compose topology maps directly to a Kubernetes deployment. The following describes the target production architecture and what would change from this test task setup.
+
+**App tier — Deployment + HorizontalPodAutoscaler**
+
+The three Spring Boot containers become a `Deployment`. Because all rate-limit state lives in Redis and no state is held in-process, every pod is fully interchangeable — scale-out adds capacity without resharding or warm-up, and scale-in loses nothing. n* and m* values should be selected based on expected traffic. 
+
+```yaml
+# Scales between n and m replicas based on CPU utilization
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rate-limiter-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: rate-limiter
+  minReplicas: n
+  maxReplicas: m
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+An `Ingress` (nginx or a cloud-native controller) handles TLS termination and routes traffic to a `Service` of type `ClusterIP`. Because the app tier is stateless, sticky sessions and consistent hashing at the load balancer are not required — any pod can serve any user correctly.
+
+**Redis tier — StatefulSet via operator or Helm**
+
+Redis Cluster runs as a `StatefulSet`, typically provisioned by the [Redis Operator](https://github.com/OT-CONTAINER-KIT/redis-operator) or the Bitnami Helm chart. Replicas provide read redundancy and automatic failover; the operator handles slot rebalancing when masters are added or removed.
+
+Lettuce (the Redis client used by Spring Data Redis) maintains a live topology view using adaptive refresh. When a master is replaced by its replica — or when new masters are added during a reshard — Lettuce detects the change on MOVED/ASK errors and reconnects without requiring app restarts. This is the same mechanism exercised by `cluster-failover.js`.
+
+**Comparison: test task vs production**
+
+
+| Concern                  | Test task (Docker Compose)    | Production (Kubernetes)                    |
+| ------------------------ | ----------------------------- | ------------------------------------------ |
+| App scaling              | Fixed 3 instances             | HPA, n — m replicas                        |
+| Redis provisioning       | Manual init container         | Operator or Helm, automated                |
+| Redis persistence        | None (ephemeral)              | RDB + AOF on PersistentVolumeClaims        |
+| TLS                      | None                          | TLS between pods and Redis                 |
+| Authentication           | None                          | `requirepass` / ACLs via Kubernetes Secret |
+| Redis horizontal scaling | Fixed 3 masters               | `redis-cli --cluster reshard`              |
+| Observability            | `/actuator/prometheus` scrape | Prometheus + Grafana dashboards, alerting  |
+| Secrets management       | Plain config                  | Kubernetes Secrets or Vault integration    |
+
+
+**Test task scope vs production:** The Docker Compose setup demonstrates the same architectural properties as the Kubernetes deployment would — stateless app tier, Redis-backed global state, cluster failover. What is not simulated here includes persistent storage, TLS, secrets management, and autoscaling. All of these would be required before production use.
 
 ---
 
@@ -229,15 +482,9 @@ Multiple `RateLimiterNode` instances are created in-process, each with its own s
 
 Demonstrate throughput under load and latency characteristics. Bonus: JMH microbenchmarks.
 
-### Decision: JMH Benchmarks for Both Implemented Algorithms
-
 Java Microbenchmark Harness (JMH) is used to benchmark both algorithms under controlled conditions. JMH handles JVM warmup phases (allowing the JIT compiler to optimize the code before measuring), prevents dead-code elimination (which would make the benchmark artificially fast by skipping computation), and controls thread count.
 
 `AlgorithmBenchmark` runs both algorithms at 8 concurrent threads to show steady-state throughput under contention. `RoutingBenchmark` runs `ConsistentHashRing.route()` at 1, 8, and 32 threads for 3-node and 5-node rings, demonstrating that routing overhead is negligible (~40 ns per call).
-
-**Why JMH over a hand-rolled benchmark?** JVM benchmarks are notoriously unreliable without proper warmup. A naive loop measuring `System.nanoTime()` before and after a method call will measure cold-start JIT compilation time and garbage collection pauses rather than steady-state performance. JMH eliminates these artifacts. It is the standard tool for JVM performance measurement and is what the requirement explicitly references.
-
-**Expected findings:** Both Token Bucket and Sliding Window Counter sustain ~16–18 million decisions per second at 8 threads. At 20,000 req/s peak load the algorithm layer consumes under 0.2% of a single CPU core. The bottleneck is always the Redis round-trip (~1 ms), not the algorithm.
 
 ---
 
@@ -291,21 +538,4 @@ Micrometer provides a vendor-neutral metrics API. The same metric definitions wo
 Resilience4j wraps the Redis adapter. The circuit breaker's state transitions (closed, open, half-open) are automatically exported as Micrometer metrics. An alert on `resilience4j.circuitbreaker.state == open` indicates Redis is unreachable, which is immediately visible in dashboards without any custom instrumentation.
 
 ---
-
-## Summary of Key Trade-offs
-
-
-| Decision                      | Chosen Approach                  | Primary Trade-off                                                                                               |
-| ----------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| Rate limit state storage      | Redis                            | Operational dependency; no state if Redis is unavailable                                                        |
-| Analytics event delivery      | Redis Streams                    | Lower throughput ceiling than Kafka; simpler operation                                                          |
-| Algorithm for burst endpoints | Token Bucket (CAS)               | Users can exceed nominal rate during burst; slight CPU overhead under extreme contention                        |
-| Algorithm for strict limits   | Sliding Window Counter           | ~1% approximation error at window boundary; very low memory                                                     |
-| Algorithms not implemented    | Sliding Window Log, Leaky Bucket | Log: memory cost outweighs exact accuracy benefit. Leaky Bucket: no burst support, redundant given Token Bucket |
-| Multi-node state distribution | Consistent hashing               | State lost for affected users on node failure; brief burst possible                                             |
-| Node failure policy           | Fail-open                        | Users can briefly exceed limits during Redis outage; availability prioritized                                   |
-| Architecture                  | Ports and adapters               | Extra interface boilerplate; complete testability and clear dependency boundaries                               |
-| Framework use                 | Spring Boot (API layer only)     | Domain fully isolated from framework; slightly more manual wiring                                               |
-| Concurrency model             | Lock-free CAS                    | CPU spin under extreme contention; 3-10x higher throughput than lock-based under normal load                    |
-
 
