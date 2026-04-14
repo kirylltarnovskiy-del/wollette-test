@@ -1,0 +1,14 @@
+package com.ratelimiter.dto;
+
+import com.ratelimiter.model.TopUser;
+import java.util.List;
+import java.util.Map;
+
+public record StatsDto(
+        long requestsPerSecond,
+        long accepted,
+        long rejected,
+        List<TopUser> topUsers,
+        Map<Long, Long> windowStats
+) {
+}
