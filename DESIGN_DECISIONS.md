@@ -351,6 +351,20 @@ Provide `POST /request`, `GET /stats`, and `GET /users/{id}/usage`.
 
 These are not arbitrary choices — RFC 6585 defines 429 as the correct status code for rate limiting, and `Retry-After` is the standardized header for communicating backoff time. Clients that respect HTTP standards will automatically back off without custom handling.
 
+### Decision: Backpressure Before the Application Layer
+
+For production, its necessary to add an upstream protection layer before the application logic runs: API Gateway or ingress-level request queue limits, connection caps, and bounded worker pools.
+
+This pre-application backpressure prevents a load spike from exhausting servlet threads, heap, or connection pools before `allowRequest` executes. It also keeps latency more predictable during overload by shedding excess traffic early instead of letting the JVM degrade into long queueing and GC pressure.
+
+### Decision: User Tier Determination Strategy
+
+The current implementation resolves user tier by `userId` prefix (`PropertiesUserConfigAdapter.getTier(userId)`). This is a deliberate simplification for a test task because it avoids introducing identity infrastructure while still exercising the full rate-limit rule engine.
+
+In production, user identity and tier would typically come from validated JWT claims (or an equivalent signed identity token) issued by an authentication provider. The request path would verify signature, issuer/audience, expiry, and then map claim values (for example `plan`, `tier`, or `roles`) to limiter rules.
+
+**Trade-off:** JWT-based tier resolution introduces runtime CPU and memory cost under high concurrency. On each request, the service typically Base64URL-decodes token segments, parses JSON claims, and performs cryptographic signature validation (for example RSA/ECDSA verification), then applies issuer/audience/expiry checks before tier mapping. Even a small 8-character role claim is 16 bytes in UTF-16 just for character storage; at 1,000,000 simultaneously processed requests, that raw claim data alone is ~16 MB before object allocations, decoded byte arrays, token wrapper structures, and framework overhead. Real memory and CPU usage are therefore materially higher and must be budgeted with bounded thread pools, request limits, and careful token parsing and key-caching strategy.
+
 ---
 
 ## 7. Failure Handling
@@ -561,4 +575,3 @@ This enables zero-downtime policy changes: no rolling restart, no cold caches, a
 - Audit every policy change (who changed what, when, and why).
 
 **Test task scope vs production:** This repository currently keeps tier rules in static application config for simplicity. That is acceptable for a bounded demo, but production should use dynamic hot reload with versioning, validation, rollback, and auditability to avoid restarts and reduce operational risk.
-
