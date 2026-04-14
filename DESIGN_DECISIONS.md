@@ -539,3 +539,26 @@ Resilience4j wraps the Redis adapter. The circuit breaker's state transitions (c
 
 ---
 
+## 12. Runtime Configuration Updates
+
+### Requirement
+
+Update rate limit rules in production without restarting rate limiter instances.
+
+### Decision: Versioned Rule Sets with Hot Reload (No App Restart)
+
+For production, rate limit policies should be treated as runtime data rather than static startup configuration. Rules are stored in a central source of truth (for example, a versioned Redis key, Config Server, or database table) and periodically pulled by each app node. When a new version appears, the node atomically swaps its in-memory rule set reference and starts using the new limits for subsequent requests.
+
+This enables zero-downtime policy changes: no rolling restart, no cold caches, and no temporary capacity drop while pods restart. Existing in-flight requests finish with the old snapshot; new requests use the new snapshot immediately after the swap.
+
+**Consistency model:** During rollout, nodes may run different rule versions for a short period (eventual consistency). This window is acceptable for quota updates, but if strict global cutover is required, add a version gate in the decision path and reject decisions made with stale policy versions.
+
+**Operational safeguards for production:**
+
+- Validate new rule sets before activation (schema + semantic checks such as `burstCapacity >= refillRate`).
+- Keep last-known-good configuration in memory and roll back automatically on invalid updates.
+- Emit a metric/log field with active `rulesVersion` so operators can detect drift between nodes.
+- Audit every policy change (who changed what, when, and why).
+
+**Test task scope vs production:** This repository currently keeps tier rules in static application config for simplicity. That is acceptable for a bounded demo, but production should use dynamic hot reload with versioning, validation, rollback, and auditability to avoid restarts and reduce operational risk.
+
