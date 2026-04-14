@@ -1,7 +1,7 @@
 package com.ratelimiter.benchmark;
 
-import com.ratelimiter.distributed.ConsistentHashRing;
-import com.ratelimiter.distributed.RateLimiterNode;
+import com.ratelimiter.benchmark.distributed.ConsistentHashRing;
+import com.ratelimiter.benchmark.distributed.RateLimiterNode;
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;

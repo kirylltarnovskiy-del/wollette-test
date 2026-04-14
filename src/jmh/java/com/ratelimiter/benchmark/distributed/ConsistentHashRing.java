@@ -1,4 +1,4 @@
-package com.ratelimiter.distributed;
+package com.ratelimiter.benchmark.distributed;
 
 import com.google.common.hash.Hashing;
 import java.nio.charset.StandardCharsets;

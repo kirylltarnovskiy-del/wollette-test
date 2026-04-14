@@ -1,4 +1,4 @@
-package com.ratelimiter.distributed;
+package com.ratelimiter.benchmark.distributed;
 
 import java.time.Instant;
 import java.util.concurrent.atomic.AtomicBoolean;

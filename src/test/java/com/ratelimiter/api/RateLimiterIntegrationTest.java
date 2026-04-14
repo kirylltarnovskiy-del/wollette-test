@@ -13,6 +13,12 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Primary;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.connection.RedisStandaloneConfiguration;
+import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
@@ -24,6 +30,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 @SpringBootTest
 @AutoConfigureMockMvc
 @Testcontainers
+@SuppressWarnings("resource")
 class RateLimiterIntegrationTest {
 
     @Container
@@ -37,6 +44,20 @@ class RateLimiterIntegrationTest {
     static void redisProps(DynamicPropertyRegistry registry) {
         registry.add("spring.data.redis.host", redis::getHost);
         registry.add("spring.data.redis.port", () -> redis.getMappedPort(6379));
+    }
+
+    @TestConfiguration
+    static class TestRedisConfiguration {
+        @Bean
+        @Primary
+        @SuppressWarnings("resource")
+        RedisConnectionFactory redisConnectionFactory() {
+            RedisStandaloneConfiguration standalone = new RedisStandaloneConfiguration(
+                    redis.getHost(),
+                    redis.getMappedPort(6379)
+            );
+            return new LettuceConnectionFactory(standalone);
+        }
     }
 
     @Test
