@@ -429,13 +429,13 @@ iterations each.
 ### Run only the routing benchmark
 
 ```bash
-./gradlew jmh --args='-f 1 -wi 3 -i 5 -rff results.json -rf json RoutingBenchmark'
+./gradlew jmh -PjmhIncludes=RoutingBenchmark -PjmhFork=1 -PjmhWarmupIterations=3 -PjmhIterations=5 -PjmhResultFormat=JSON -PjmhResultsFile=results.json
 ```
 
 ### Run only the algorithm benchmark
 
 ```bash
-./gradlew jmh --args='-f 1 -wi 3 -i 5 AlgorithmBenchmark'
+./gradlew jmh -PjmhIncludes=AlgorithmBenchmark -PjmhFork=1 -PjmhWarmupIterations=3 -PjmhIterations=5
 ```
 
 ---

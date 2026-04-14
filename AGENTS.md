@@ -36,7 +36,7 @@ Use this guide to keep agent behavior consistent with project conventions.
 - Run tests after functional edits:
   - `./gradlew test` (or `.\gradlew.bat test` on Windows)
 - Run focused benchmarks only when performance behavior changes:
-  - `./gradlew jmh --args='-f 1 -wi 3 -i 5 AlgorithmBenchmark'`
+  - `./gradlew jmh -PjmhIncludes=AlgorithmBenchmark -PjmhFork=1 -PjmhWarmupIterations=3 -PjmhIterations=5`
 
 ### Local stack checks
 - Multi-node stack: `docker compose up --build -d`

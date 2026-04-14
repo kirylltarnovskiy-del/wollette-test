@@ -238,8 +238,8 @@ docker run --rm -p 8080:8080 \
 
 ```bash
 ./gradlew jmh                                          # run all benchmarks
-./gradlew jmh --args='-f 1 -wi 3 -i 5 AlgorithmBenchmark'
-./gradlew jmh --args='-f 1 -wi 3 -i 5 RoutingBenchmark'
+./gradlew jmh -PjmhIncludes=AlgorithmBenchmark -PjmhFork=1 -PjmhWarmupIterations=3 -PjmhIterations=5
+./gradlew jmh -PjmhIncludes=RoutingBenchmark -PjmhFork=1 -PjmhWarmupIterations=3 -PjmhIterations=5
 ```
 
 | Benchmark | Expected result | Interpretation |

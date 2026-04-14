@@ -2,6 +2,7 @@ plugins {
     id 'java'
     id 'org.springframework.boot' version '3.3.4'
     id 'io.spring.dependency-management' version '1.1.6'
+    id 'me.champeau.jmh' version '0.7.3'
 }
 
 group = 'com.ratelimiter'
@@ -15,20 +16,6 @@ java {
 
 repositories {
     mavenCentral()
-}
-
-configurations {
-    jmhImplementation.extendsFrom implementation
-    jmhRuntimeOnly.extendsFrom runtimeOnly
-}
-
-sourceSets {
-    jmh {
-        java.srcDirs = ['src/jmh/java']
-        resources.srcDirs = ['src/jmh/resources']
-        compileClasspath += sourceSets.main.output + sourceSets.test.output + configurations.testRuntimeClasspath
-        runtimeClasspath += output + compileClasspath
-    }
 }
 
 dependencies {
@@ -48,20 +35,36 @@ dependencies {
     testImplementation 'org.testcontainers:junit-jupiter:1.20.2'
     testImplementation 'org.testcontainers:testcontainers:1.20.2'
 
-    jmhImplementation 'org.openjdk.jmh:jmh-core:1.37'
-    jmhAnnotationProcessor 'org.openjdk.jmh:jmh-generator-annprocess:1.37'
 }
 
 tasks.named('test') {
     useJUnitPlatform()
 }
 
-tasks.register('jmh', JavaExec) {
-    group = 'verification'
-    description = 'Run JMH benchmarks.'
-    classpath = sourceSets.jmh.runtimeClasspath
-    mainClass = 'org.openjdk.jmh.Main'
-    javaLauncher = javaToolchains.launcherFor {
+jmh {
+    jmhVersion = '1.37'
+    jvm = javaToolchains.launcherFor {
         languageVersion = JavaLanguageVersion.of(21)
+    }.get().executablePath.asFile.absolutePath
+
+    // Optional command-line overrides, e.g.:
+    // ./gradlew jmh -PjmhIncludes=AlgorithmBenchmark -PjmhFork=1 -PjmhWarmupIterations=3 -PjmhIterations=5
+    if (project.hasProperty('jmhIncludes')) {
+        includes = [project.property('jmhIncludes').toString()]
+    }
+    if (project.hasProperty('jmhFork')) {
+        fork = project.property('jmhFork').toString().toInteger()
+    }
+    if (project.hasProperty('jmhWarmupIterations')) {
+        warmupIterations = project.property('jmhWarmupIterations').toString().toInteger()
+    }
+    if (project.hasProperty('jmhIterations')) {
+        iterations = project.property('jmhIterations').toString().toInteger()
+    }
+    if (project.hasProperty('jmhResultFormat')) {
+        resultFormat = project.property('jmhResultFormat').toString()
+    }
+    if (project.hasProperty('jmhResultsFile')) {
+        resultsFile = file(project.property('jmhResultsFile').toString())
     }
 }
